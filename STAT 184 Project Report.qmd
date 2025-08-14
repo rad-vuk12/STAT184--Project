@@ -1,0 +1,249 @@
+---
+title: "Project Report"
+author: "Vuk Radulovic"
+format:
+  pdf:
+    fig-pos: 'ht!'
+    tbl-cap-location: top
+number-sections: true
+execute: 
+  echo: false
+  warning: false
+  message: false
+
+# BOAST style guide- It emphasizes clear object names, consistent spacing, and short, readable pipelines which is ideal for EDA. You’ll see that in variable names like `matches_feat` and functions like `clean_tournament()`.
+# https://educationshinyappteam.github.io/Style_Guide/coding.html
+---
+
+## Introduction
+
+### Research questions:
+
+1)  How has the **average number of goals per international match** changed over time?
+2)  How strong is **home field advantage**, and does it differ between **friendly games** and **tournaments**?
+
+I will use historical match dataset (1872-present), and from it, use year, total goals, result towards answering the research questions. Additionally, I will use a compiled **confederation** mapping, and a basic **Elo-style rating** to add context to the overall result.
+
+## Background Information
+
+Soccer has been around for centuries, and with it, the state of the game changed. More notably, the strategies developed, players becoming more athletic, etc. These naturally affect the scores in games, which is what we're looking to research. Additionally, within soccer community, home field advantage is known to affect the state of the game, mostly due to the atmosphere home crowd is able to create, and this is what will look for in our data as well. Lastly, for further context we will look into friendly games vs tournaments, and official team rankings, as these will add context into scores and home field advantage.
+
+## Data Summary
+
+**Primary**: International football results, 1872-present (each row is one match, fields include date, teams, scores, tournament, location) https://www.kaggle.com/datasets/martj42/international-football-results-from-1872-to-2017
+
+**Secondary A (compiled)**: `country_confederation.csv`- Compiled mapping(team -\> UEFA/CONMEBOL/CONCACAF/AFC/CAF/OFC)
+
+**Secondary B (derived)**: `team_strength_ratings.csv`- Computed simple Elo-style rating from the primary data (everyone starts at 1500; K=20,draw=0.5, no home bonus)
+
+**countries_names.csv**: Mapping to standardize name changes over the years.
+
+### Attributes used
+
+I will focus on: `year`, `total_goals`,`result`,`match_type` (friendly vs tournament), `neutral`, `home_confed`/`away_confed`, and `home_rating`/`away_rating`
+
+```{r}
+#| label: Setup-and-wrangling
+#| include: false
+
+library(tidyverse)
+library(lubridate)
+library(stringr)
+
+data_dir <- "Stat184DATA"
+matches <- readr::read_csv("C:/Users/Jake Iovacchini/OneDrive/Desktop/Stat184DATA/all_matches.csv")
+confed <- readr::read_csv("C:/Users/Jake Iovacchini/OneDrive/Desktop/Stat184DATA/country_confederation.csv")
+ratings <- readr::read_csv("C:/Users/Jake Iovacchini/OneDrive/Desktop/Stat184DATA/team_strength_ratings.csv")
+countries <- readr::read_csv("C:/Users/Jake Iovacchini/OneDrive/Desktop/Stat184DATA/countries_names.csv")
+
+# Wrangling
+matches_clean <- matches |>
+  mutate(
+    date = ymd(date),
+    year = year(date),
+    total_goals = home_score + away_score,
+    result = case_when(
+      home_score > away_score ~ "Home Win",
+      home_score < away_score ~ "Away Win",
+      TRUE ~ "Draw"
+    )
+  )
+# Normalization
+clean_tournament <- function(x) {
+  x |>
+    str_to_lower() |>  # making everything lowercase
+    str_replace_all("\\s+", " ") |> # making everything single space
+    str_replace_all("qualif(ication)?s?", "qualifiers") |> # "qualifications" turned into "qualifiers" for easy recognition
+    str_replace_all("fifa world cup( finals)?", "world cup") |> #normalizing into world cup
+    str_trim()
+}
+
+matches_std <- matches_clean |>
+  mutate(
+    tourn_clean = clean_tournament(tournament), # make naming consistent
+    match_type  = if_else(str_detect(tourn_clean, "friendly"), "Friendly", "Tournament"), # differentiating friendly from tournament
+    home_team_std = if (!is.null(countries))
+      coalesce(recode(home_team, !!!setNames(countries$current_name, countries$original_name)), home_team) else home_team,
+    away_team_std = if (!is.null(countries))
+      coalesce(recode(away_team, !!!setNames(countries$current_name, countries$original_name)), away_team) else away_team
+  )
+
+# We'll be joining confederations with ratings
+matches_confed <- matches_std |>
+  left_join(confed, by = c("home_team_std" = "team_name")) |>
+  rename(home_confed = confederation) |>
+  left_join(confed, by = c("away_team_std" = "team_name")) |>
+  rename(away_confed = confederation)
+
+matches_feat <- matches_confed |>
+  left_join(ratings |> select(team, rating) |> rename(home_team_std = team, home_rating = rating),
+            by = "home_team_std") |>
+  left_join(ratings |> select(team, rating) |> rename(away_team_std = team, away_rating = rating),
+            by = "away_team_std")
+
+# pivot_wider option
+yearly_counts_wide <- matches_feat |>
+  count(year, result) |>
+  tidyr::pivot_wider(names_from = result, values_from = n, values_fill = 0) |>
+  arrange(year)
+
+# Reduction
+by_decade <- matches_feat |>
+  mutate(decade = paste0(floor(year/10)*10, "s")) |>
+  group_by(decade) |>
+  summarise(n_matches = n(),
+            avg_goals = mean(total_goals, na.rm = TRUE),
+            draw_rate = mean(result == "Draw"),
+            .groups = "drop")
+
+top_scoring <- matches_feat |>
+  arrange(desc(total_goals)) |>
+  select(date, home_team, away_team, home_score, away_score, total_goals) |>
+  slice_head(n = 10)
+
+by_type <- matches_feat |>
+  group_by(match_type) |>
+  summarise(home_win_rate = mean(result == "Home Win"),
+            draw_rate = mean(result == "Draw"),
+            away_win_rate = mean(result == "Away Win"),
+            n = dplyr::n(), .groups = "drop")
+
+by_neutral <- matches_feat |>
+  group_by(neutral) |>
+  summarise(home_win_rate = mean(result == "Home Win"),
+            draw_rate = mean(result == "Draw"),
+            away_win_rate = mean(result == "Away Win"),
+            n = dplyr::n(), .groups = "drop")
+
+rating_gap_tbl <- matches_feat |>
+  mutate(rating_gap = home_rating - away_rating,
+         gap_bucket = cut(rating_gap, breaks = c(-Inf,-200,-50,50,200,Inf))) |>
+  group_by(gap_bucket) |>
+  summarise(home_win_rate = mean(result == "Home Win"),
+            n = dplyr::n(), .groups = "drop")
+```
+
+## EDA
+
+### Tables
+
+@tbl-decade shows match count, average goals, and draw rates by decade.
+
+```{r}
+#| label: tbl-decade
+#| tbl-cap: "Matches, average goals, and draw rate by decade"
+by_decade
+```
+We can see a trend of reduction in amount of average goals 
+
+@tbl-topten shows top 10 highest scoring international matches
+
+```{r}
+#| lablel: tbl-topten
+#| tbl-cap: "Top 10 highest scoring international matches"
+top_scoring
+```
+These will most likely be outliers given the sheer amount of goals scored
+
+@tbl-type compares result rates by match type- friendlies vs tournament
+
+```{r}
+#| label: tbl-type
+#| tbl-cap: "Results by match type(friendly vs tournament)"
+by_type
+```
+In both cases we see a higher rate of home wins, with tournament games having higher home win rate and lower away win rate
+
+### Visualization
+
+@fig-goaldist shows distribution of total goals
+
+```{r}
+#| lablel: fig-goaldist
+#| fig-cap: "Distribution of total goals per match"
+ggplot(matches_feat, aes(total_goals)) +
+  geom_histogram(binwidth = 1) +
+  labs(x = "Goals in match", y = "Count")
+```
+As we can see, most games have about 2-3 goals
+
+@fig-resultbar shows the overall outcomes in Home/Draw/Away games
+
+```{r}
+#| label: fig-resultbar
+#| fig-cap: "Overall result breakdown"
+ggplot(matches_feat, aes(result)) +
+  geom_bar() +
+  labs(x = NULL, y = "Matches")
+```
+Graph shows us home teams win significantly more games
+
+@fig-yearly shows average goals over time. This will show trends and changes in it
+
+```{r}
+#| label: fig-yearly
+#| fig-cap: "Average goals per match by year"
+matches_feat |>
+  group_by(year) |>
+  summarise(avg_goals = mean(total_goals, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(year, avg_goals)) +
+  geom_line() +
+  labs(x = "Year", y = "Average goals")
+```
+The trend shows a significant drop in goals scored across time
+
+@fig-ratinggap shows home advantage with rating gap added into context, this allows us to better understand home wins
+
+```{r}
+#| label: fig-ratinggap
+#| fig-cap: "Home win rate vs rating gap (bucketed)"
+rating_gap_tbl |>
+  ggplot(aes(gap_bucket, home_win_rate)) +
+  geom_col() +
+  labs(x = "Home − Away rating (bucket)", y = "Home win rate")
+```
+The graph tells us the higher the rating gap is for the home team, the more they win their home games
+
+## Conclusion
+Looking at all the available data, we can draw a good number of conclusions. Firstly, there is a significant reduction in average goals since th 1870s. Back then, they averaged 4.54 goals while in the 2020s they averaged 2.67 goals. It is important to note:
+
+1. The draw rate is higher in 2020s vs 1870s
+2. There have been only 13 matches in 1870s vs 2020s
+
+This is significant because the data is skewed because the volume of games increased across the years. Next, when looking at friendly vs tournament games, we see a higher rate of home wins during tournaments compared to friendlies. It is important to note that there are almost double the amount of tournament games compared to friendlies which might skew results. Furthermore, we can see that teams with a higher rating gap will win home games at a higher rate, as seen in Figure 4. This could be supported by the table showing top 10 highest scoring matches.
+
+The biggest limitation is lack of more data, we are working with data that will give us a glimpse into our research question. With more data points we can introduce more context into the research. For example, we know there were only 13 games played in 1870s, and we're halfway into 2020s so we can't compare 2020s with 2010s that have almost double the amount of games. Further steps for this research would be more in depth look into each decade.
+
+## References 
+International football results(J&uuml;risoo, Mart. “International Football Results from 1872 to 2025.” Kaggle, 7 July 2025, www.kaggle.com/datasets/martj42/international-football-results-from-1872-to-2017. Accessed 13 Aug. 2025.)
+
+Author-compiled `country_confederation.csv`(“Inside FIFA.” FIFA, inside.fifa.com/associations. Accessed 13 Aug. 2025.)
+
+Author-compiled `team_strength_ratings.csv` (method: simple Elo update from primary data)
+
+R for Data science (Hadley Wickham, Mine Çetinkaya-Rundel. “R for Data Science (2E).” R for Data Science (2e), r4ds.hadley.nz/. Accessed 13 Aug. 2025.)
+
+## Code Appendix
+
+```{r code-appendix, ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
